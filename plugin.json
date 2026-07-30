@@ -1,0 +1,23 @@
+{
+  "slug": "VisionCV",
+  "name": "VisionCV",
+  "version": "2.0.0",
+  "license": "BSD-3-Clause",
+  "brand": "VisionCV",
+  "author": "jmskjevling",
+  "authorEmail": "jmskjevling@gmail.com",
+  "authorUrl": "",
+  "pluginUrl": "",
+  "manualUrl": "",
+  "sourceUrl": "",
+  "donateUrl": "",
+  "changelogUrl": "",
+  "modules": [
+    {
+      "slug": "VisionCV",
+      "name": "VisionCV",
+      "description": "Turns a live camera feed into CV: brightness, RGB levels, motion, and brightest-spot/color-blob position tracking.",
+      "tags": ["Visual", "Utility", "Controller"]
+    }
+  ]
+}
