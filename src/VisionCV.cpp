@@ -49,10 +49,21 @@ static const float COL_RIGHT_X = DISPLAY_X + DISPLAY_W - OUT_BOX_W / 2.f;
 // Knob rows: a RoundBlackKnob is ~10mm across (5mm radius), so a label
 // needs to sit ~6mm above its own row's control center to clear it, and
 // 15mm of row pitch clears the row above's knob too.
-static const float ROW1_LABEL_Y = 53.f; // mode / hue / freeze
+static const float ROW1_LABEL_Y = 53.f; // mode / hue / tolerance
 static const float ROW1_Y = 59.f;
-static const float ROW2_LABEL_Y = 68.f; // tolerance / motion sens / smoothing
+static const float ROW2_LABEL_Y = 68.f; // freeze / motion sens / smoothing
 static const float ROW2_Y = 74.f;
+
+// Small round hue/mode indicator between the MODE switch and HUE knob — see
+// HueIndicatorWidget. Horizontal position uses each neighbor's actual
+// visual edge (not just the midpoint of their param centers), since CKSS
+// (MODE) and RoundBlackKnob (HUE) aren't the same width. Vertically
+// centered on the knob's own row (ROW1_Y) to read as physically aligned
+// with the knob, the way an LED would be on a real panel.
+static const float CKSS_HALF_W = 2.373f; // CKSS switch is ~4.75mm wide
+static const float KNOB_RADIUS = 5.08f; // RoundBlackKnob is ~10.16mm across
+static const float HUE_INDICATOR_X = ((COL_LEFT_X + CKSS_HALF_W) + (COL_CENTER_X - KNOB_RADIUS)) / 2.f;
+static const float HUE_INDICATOR_D = 4.f;
 
 static const float DIVIDER_Y = 81.f;
 
@@ -60,11 +71,11 @@ static const float DIVIDER_Y = 81.f;
 // of 3 instead of 2 rows of 4, matching the knob columns above. Outputs are
 // marked with an inverted (white box, black text) label that wraps the jack
 // as well as the text — see OutputBoxWidget.
-static const float JACK_ROW1_LABEL_Y = 86.f; // freeze / red / green
+static const float JACK_ROW1_LABEL_Y = 86.f; // freeze / found / bright
 static const float JACK_ROW1_Y = 91.f;
-static const float JACK_ROW2_LABEL_Y = 99.f; // blue / bright / motion
+static const float JACK_ROW2_LABEL_Y = 99.f; // red / green / blue
 static const float JACK_ROW2_Y = 104.f;
-static const float JACK_ROW3_LABEL_Y = 112.f; // pos x / pos y / found
+static const float JACK_ROW3_LABEL_Y = 112.f; // motion / pos x / pos y
 static const float JACK_ROW3_Y = 117.f;
 } // namespace layout
 
@@ -199,10 +210,30 @@ struct VisionCV : Module {
 		std::string name = camera.getDeviceName();
 		if (!name.empty())
 			json_object_set_new(rootJ, "cameraName", json_string(name.c_str()));
+
+		CameraWorker::FormatOption fmt = camera.getCurrentFormat();
+		if (fmt.width > 0 && fmt.height > 0) {
+			json_object_set_new(rootJ, "resolutionWidth", json_integer(fmt.width));
+			json_object_set_new(rootJ, "resolutionHeight", json_integer(fmt.height));
+			json_object_set_new(rootJ, "resolutionFps", json_integer(fmt.fps));
+		}
 		return rootJ;
 	}
 
 	void dataFromJson(json_t* rootJ) override {
+		// Apply the saved resolution preference before selecting the camera
+		// (below), so the very first connect already uses it — setting a
+		// preference with no camera open yet is a harmless no-op otherwise.
+		json_t* widthJ = json_object_get(rootJ, "resolutionWidth");
+		json_t* heightJ = json_object_get(rootJ, "resolutionHeight");
+		if (widthJ && heightJ) {
+			json_t* fpsJ = json_object_get(rootJ, "resolutionFps");
+			camera.setPreferredFormat(
+				static_cast<uint32_t>(json_integer_value(widthJ)),
+				static_cast<uint32_t>(json_integer_value(heightJ)),
+				fpsJ ? static_cast<uint32_t>(json_integer_value(fpsJ)) : 0);
+		}
+
 		json_t* uidJ = json_object_get(rootJ, "cameraUniqueId");
 		if (uidJ) {
 			// Non-blocking: just posts the request. The worker thread
@@ -244,6 +275,32 @@ static void populateCameraMenu(Menu* menu, VisionCV* module) {
 }
 
 
+/** Populates a menu with one checkable item per resolution/frame-rate the
+currently open camera reports. Right-click only — unlike camera selection,
+this doesn't need on-panel discoverability, and the picks are numerous
+enough that a submenu makes more sense than a permanent panel control. */
+static void populateResolutionMenu(Menu* menu, VisionCV* module) {
+	menu->addChild(createMenuLabel("Resolution / frame rate"));
+
+	std::vector<CameraWorker::FormatOption> formats = module->camera.listFormats();
+	if (formats.empty()) {
+		menu->addChild(createMenuLabel("(select a camera first)"));
+		return;
+	}
+
+	CameraWorker::FormatOption current = module->camera.getCurrentFormat();
+	for (size_t i = 0; i < formats.size(); i++) {
+		CameraWorker::FormatOption f = formats[i];
+		std::string label = std::to_string(f.width) + " x " + std::to_string(f.height)
+			+ "  (" + std::to_string(f.fps) + " fps)";
+		menu->addChild(createCheckMenuItem(label, "",
+			[=]() { return f.width == current.width && f.height == current.height && f.fps == current.fps; },
+			[=]() { module->camera.setPreferredFormat(f.width, f.height, f.fps); }
+		));
+	}
+}
+
+
 /** Standard RGB (0..255 each) -> normalized hue (0..1), matching how
 FrameAnalyzer maps VisionCV::HUE_PARAM (0..1) to OpenCV's 0..179 hue range
 (targetHue * 179 there == hueDegrees/360 here, near enough — OpenCV's 8-bit
@@ -267,6 +324,77 @@ static float rgbToHueNormalized(uint8_t r8, uint8_t g8, uint8_t b8) {
 		hueDeg += 360.f;
 	return hueDeg / 360.f;
 }
+
+
+/** Inverse of rgbToHueNormalized: normalized hue (0..1) -> full-saturation,
+full-value RGB, for displaying what a target hue actually looks like (the
+HUE_PARAM knob has no visual feedback of its own otherwise). */
+static NVGcolor hueNormalizedToRgb(float hueNorm) {
+	float h = hueNorm * 360.f;
+	float c = 1.f; // chroma: S=1, V=1
+	float x = c * (1.f - std::fabs(std::fmod(h / 60.f, 2.f) - 1.f));
+	float r1 = 0.f, g1 = 0.f, b1 = 0.f;
+	if (h < 60.f) { r1 = c; g1 = x; b1 = 0.f; }
+	else if (h < 120.f) { r1 = x; g1 = c; b1 = 0.f; }
+	else if (h < 180.f) { r1 = 0.f; g1 = c; b1 = x; }
+	else if (h < 240.f) { r1 = 0.f; g1 = x; b1 = c; }
+	else if (h < 300.f) { r1 = x; g1 = 0.f; b1 = c; }
+	else { r1 = c; g1 = 0.f; b1 = x; }
+	return nvgRGB(static_cast<uint8_t>(r1 * 255.f), static_cast<uint8_t>(g1 * 255.f), static_cast<uint8_t>(b1 * 255.f));
+}
+
+
+/** Small round LED between the MODE switch and HUE knob. Only "lit" (shows
+the actual target color) in color-blob mode, since hue does nothing in
+brightest-spot mode — unlit otherwise, so it doubles as a live mode
+indicator without needing a separate widget for that. */
+struct HueIndicatorWidget : widget::Widget {
+	VisionCV* module = nullptr;
+
+	void draw(const DrawArgs& args) override {
+		float radius = box.size.x / 2.f;
+		float cx = radius, cy = radius;
+
+		bool colorBlobMode = module && module->params[VisionCV::MODE_PARAM].getValue() > 0.5f;
+		NVGcolor baseColor = colorBlobMode
+			? hueNormalizedToRgb(module->params[VisionCV::HUE_PARAM].getValue())
+			: nvgRGB(0x2a, 0x2b, 0x30); // unlit: a bit lighter than the panel so it still reads as a dark bead, not an empty hole
+
+		// Mostly flat, fully-saturated fill — only the outer rim shades
+		// darker, keeping the hue itself intact instead of washing it out.
+		NVGcolor rimShade = nvgLerpRGBA(baseColor, nvgRGBA(0, 0, 0, 255), 0.3f);
+		NVGpaint fillGradient = nvgRadialGradient(args.vg, cx, cy, radius * 0.7f, radius, baseColor, rimShade);
+
+		nvgBeginPath(args.vg);
+		nvgCircle(args.vg, cx, cy, radius);
+		nvgFillPaint(args.vg, fillGradient);
+		nvgFill(args.vg);
+
+		// Bezel ring first, so the highlight below is drawn on top of it
+		// (previously the bezel — drawn last, at an overlapping radius —
+		// was painting right over most of the highlight arc, nearly
+		// erasing it).
+		nvgBeginPath(args.vg);
+		nvgCircle(args.vg, cx, cy, radius - 0.5f);
+		nvgStrokeColor(args.vg, nvgRGB(0x3a, 0x3c, 0x42));
+		nvgStrokeWidth(args.vg, 1.f);
+		nvgStroke(args.vg);
+
+		// Thin highlight along the upper-left edge — light catching the
+		// curved rim — instead of a soft specular blob across the surface.
+		// Pulled in clearly inside the bezel's footprint, and bolder than
+		// before: at this widget's small size (~4mm), a faint/thin stroke
+		// all but disappears once antialiased.
+		nvgBeginPath(args.vg);
+		nvgArc(args.vg, cx, cy, radius - 1.4f, static_cast<float>(M_PI), static_cast<float>(1.5 * M_PI), NVG_CW);
+		nvgStrokeColor(args.vg, nvgRGBA(255, 255, 255, 210));
+		nvgStrokeWidth(args.vg, 1.f);
+		nvgLineCap(args.vg, NVG_ROUND);
+		nvgStroke(args.vg);
+
+		Widget::draw(args);
+	}
+};
 
 
 /** On-panel clickable display showing the selected camera (or a prompt to
@@ -466,6 +594,12 @@ struct VisionCVWidget : ModuleWidget {
 		cameraDisplay->module = module;
 		addChild(cameraDisplay);
 
+		HueIndicatorWidget* hueIndicator = createWidget<HueIndicatorWidget>(
+			mm2px(Vec(HUE_INDICATOR_X - HUE_INDICATOR_D / 2.f, ROW1_Y - HUE_INDICATOR_D / 2.f)));
+		hueIndicator->box.size = mm2px(Vec(HUE_INDICATOR_D, HUE_INDICATOR_D));
+		hueIndicator->module = module;
+		addChild(hueIndicator);
+
 		auto addOutputBox = [&](float xmm, float labelYmm, float portYmm) {
 			float topMm = labelYmm - OUT_BOX_TOP_PAD;
 			float bottomMm = portYmm + OUT_BOX_BOTTOM_PAD;
@@ -609,6 +743,9 @@ struct VisionCVWidget : ModuleWidget {
 
 		menu->addChild(new MenuSeparator);
 		populateCameraMenu(menu, module);
+
+		menu->addChild(new MenuSeparator);
+		populateResolutionMenu(menu, module);
 	}
 };
 

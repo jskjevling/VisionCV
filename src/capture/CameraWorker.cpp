@@ -1,28 +1,28 @@
 #include "CameraWorker.hpp"
+#include "CameraSessionManager.hpp"
+#include "SharedCameraSession.hpp"
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 #include <chrono>
-#include <cstdlib>
 #include <algorithm>
-
-using Clock = std::chrono::steady_clock;
 
 
 CameraWorker::CameraWorker() {
-	// Deliberately does nothing but start the thread: see the class comment
-	// in CameraWorker.hpp for why Cap_createContext() must not run here.
-	worker = std::thread(&CameraWorker::threadLoop, this);
+	worker = std::thread(&CameraWorker::analysisThreadLoop, this);
 }
 
 CameraWorker::~CameraWorker() {
 	running = false;
 	if (worker.joinable())
 		worker.join();
+	// `session` (a shared_ptr) is destroyed along with this object here;
+	// if this was the last subscriber to that physical camera,
+	// CameraSessionManager's background thread notices on its next tick
+	// and closes the underlying stream.
 }
 
 std::vector<CameraWorker::DeviceInfo> CameraWorker::listDevices() {
-	std::lock_guard<std::mutex> lock(deviceCacheMutex);
-	return deviceCache;
+	return CameraSessionManager::instance().listDevices();
 }
 
 void CameraWorker::selectDevice(int index) {
@@ -63,7 +63,7 @@ void CameraWorker::setAnalysisParams(const AnalysisParams& params) {
 
 AnalysisResult CameraWorker::getLatestResult() {
 	AnalysisResult result = frameBuffer.read();
-	result.connected = connected.load();
+	result.connected = isConnected();
 	return result;
 }
 
@@ -71,129 +71,39 @@ Thumbnail CameraWorker::getLatestThumbnail() {
 	return thumbnailBuffer.read();
 }
 
+bool CameraWorker::isConnected() {
+	std::lock_guard<std::mutex> lock(sessionMutex);
+	return session && session->isConnected();
+}
+
 std::string CameraWorker::getDeviceName() {
-	std::lock_guard<std::mutex> lock(nameMutex);
-	return deviceName;
+	std::lock_guard<std::mutex> lock(sessionMutex);
+	return session ? session->getDeviceName() : std::string();
 }
 
 std::string CameraWorker::getDeviceUniqueId() {
-	std::lock_guard<std::mutex> lock(nameMutex);
-	return deviceUniqueId;
+	std::lock_guard<std::mutex> lock(sessionMutex);
+	return session ? session->getDeviceUniqueId() : std::string();
 }
 
-CapFormatID CameraWorker::pickFormat(CapDeviceID index, uint32_t& outWidth, uint32_t& outHeight) {
-	// Aim for something close to 640x480 at a usable frame rate: enough
-	// resolution for stable analysis without wasting CPU on a full-res feed.
-	const uint32_t targetW = 640;
-	const uint32_t targetH = 480;
-
-	int32_t numFormats = Cap_getNumFormats(ctx, index);
-	CapFormatID best = 0;
-	long bestScore = -1;
-	outWidth = targetW;
-	outHeight = targetH;
-
-	for (int32_t i = 0; i < numFormats; i++) {
-		CapFormatInfo info;
-		if (Cap_getFormatInfo(ctx, index, static_cast<CapFormatID>(i), &info) != CAPRESULT_OK)
-			continue;
-
-		long score = std::labs(static_cast<long>(info.width) - static_cast<long>(targetW))
-			+ std::labs(static_cast<long>(info.height) - static_cast<long>(targetH));
-		if (info.fps < 15)
-			score += 100000; // strongly deprioritize very low frame rates
-
-		if (bestScore < 0 || score < bestScore) {
-			bestScore = score;
-			best = static_cast<CapFormatID>(i);
-			outWidth = info.width;
-			outHeight = info.height;
-		}
-	}
-	return best;
+std::vector<CameraWorker::FormatOption> CameraWorker::listFormats() {
+	std::lock_guard<std::mutex> lock(sessionMutex);
+	return session ? session->listFormats() : std::vector<FormatOption>();
 }
 
-void CameraWorker::refreshDeviceCache() {
-	std::vector<DeviceInfo> devices;
-	uint32_t count = Cap_getDeviceCount(ctx);
-	devices.reserve(count);
-	for (uint32_t i = 0; i < count; i++) {
-		DeviceInfo info;
-		const char* name = Cap_getDeviceName(ctx, i);
-		const char* uid = Cap_getDeviceUniqueID(ctx, i);
-		info.name = name ? name : ("Camera " + std::to_string(i));
-		info.uniqueId = uid ? uid : "";
-		devices.push_back(info);
-	}
-	std::lock_guard<std::mutex> lock(deviceCacheMutex);
-	deviceCache = devices;
+CameraWorker::FormatOption CameraWorker::getCurrentFormat() {
+	std::lock_guard<std::mutex> lock(sessionMutex);
+	return session ? session->getCurrentFormat() : FormatOption();
 }
 
-void CameraWorker::closeStreamInternal() {
-	if (stream >= 0) {
-		Cap_closeStream(ctx, stream);
-		stream = -1;
-	}
-	connected = false;
-	std::lock_guard<std::mutex> lock(nameMutex);
-	deviceName.clear();
-	deviceUniqueId.clear();
+void CameraWorker::setPreferredFormat(uint32_t width, uint32_t height, uint32_t fps) {
+	std::lock_guard<std::mutex> lock(sessionMutex);
+	if (session)
+		session->setPreferredFormat(width, height, fps);
 }
 
-void CameraWorker::openDeviceInternal(int index) {
-	closeStreamInternal();
-
-	if (index < 0)
-		return;
-
-	uint32_t count = Cap_getDeviceCount(ctx);
-	if (static_cast<uint32_t>(index) >= count)
-		return;
-
-	uint32_t w = 0, h = 0;
-	CapFormatID fmt = pickFormat(static_cast<CapDeviceID>(index), w, h);
-	CapStream s = Cap_openStream(ctx, static_cast<CapDeviceID>(index), fmt);
-	if (s < 0)
-		return;
-
-	stream = s;
-	frameWidth = static_cast<int>(w);
-	frameHeight = static_cast<int>(h);
-	rgbBuffer.assign(static_cast<size_t>(frameWidth) * frameHeight * 3, 0);
-
-	const char* name = Cap_getDeviceName(ctx, static_cast<CapDeviceID>(index));
-	const char* uid = Cap_getDeviceUniqueID(ctx, static_cast<CapDeviceID>(index));
-	{
-		std::lock_guard<std::mutex> lock(nameMutex);
-		deviceName = name ? name : "";
-		deviceUniqueId = uid ? uid : "";
-	}
-
-	analyzer.reset();
-	frameCounter = 0;
-	// Deliberately NOT setting connected = true here: opening the stream
-	// only means the capture session was configured successfully, not that
-	// frames are actually arriving yet. `connected` should reflect real
-	// frame delivery, so it's only set true in threadLoop() after a
-	// successful Cap_captureFrame() — otherwise the status light can show
-	// "connected" while nothing is actually flowing.
-}
-
-void CameraWorker::threadLoop() {
-	// Cap_createContext() triggers macOS's camera-authorization flow — must
-	// happen here, on this dedicated thread, never on the caller's thread.
-	ctx = Cap_createContext();
-
-	// Force an immediate device-list refresh on the first iteration.
-	Clock::time_point lastEnumerate = Clock::now() - std::chrono::seconds(10);
-
+void CameraWorker::analysisThreadLoop() {
 	while (running.load()) {
-		Clock::time_point now = Clock::now();
-		if (now - lastEnumerate > std::chrono::milliseconds(1000)) {
-			refreshDeviceCache();
-			lastEnumerate = now;
-		}
-
 		bool doClose = false, doSelect = false, doSelectUid = false;
 		int idx = -1;
 		std::string uid;
@@ -211,72 +121,78 @@ void CameraWorker::threadLoop() {
 			if (selectByUidRequested) {
 				doSelectUid = true;
 				uid = requestedUid;
-				// Cleared below only if we can actually attempt a match
-				// (cache non-empty); otherwise left pending to retry.
-			}
-		}
-
-		if (doClose)
-			closeStreamInternal();
-		if (doSelect)
-			openDeviceInternal(idx);
-		if (doSelectUid) {
-			std::vector<DeviceInfo> devices;
-			{
-				std::lock_guard<std::mutex> lock(deviceCacheMutex);
-				devices = deviceCache;
-			}
-			if (!devices.empty()) {
-				for (size_t i = 0; i < devices.size(); i++) {
-					if (devices[i].uniqueId == uid) {
-						openDeviceInternal(static_cast<int>(i));
-						break;
-					}
-				}
-				std::lock_guard<std::mutex> lock(requestMutex);
 				selectByUidRequested = false;
 			}
-			// else: cache not populated yet, retry next iteration.
 		}
 
-		bool hasFrame = (stream >= 0) && Cap_hasNewFrame(ctx, stream) != 0;
-		if (!hasFrame) {
+		// Unlike the old per-instance capture design, acquiring a session
+		// is a cheap, synchronous, non-blocking call (CameraSessionManager
+		// resolves/opens it asynchronously on its own thread) — no retry
+		// bookkeeping needed here.
+		if (doClose) {
+			std::lock_guard<std::mutex> lock(sessionMutex);
+			session.reset();
+			analyzer.reset();
+			lastSeenRawFrameCounter = 0;
+		}
+		if (doSelect) {
+			std::shared_ptr<SharedCameraSession> s = CameraSessionManager::instance().acquireByIndex(idx);
+			std::lock_guard<std::mutex> lock(sessionMutex);
+			session = s;
+			analyzer.reset();
+			lastSeenRawFrameCounter = 0;
+		}
+		if (doSelectUid) {
+			std::shared_ptr<SharedCameraSession> s = CameraSessionManager::instance().acquireByUniqueId(uid);
+			std::lock_guard<std::mutex> lock(sessionMutex);
+			session = s;
+			analyzer.reset();
+			lastSeenRawFrameCounter = 0;
+		}
+
+		std::shared_ptr<SharedCameraSession> s;
+		{
+			std::lock_guard<std::mutex> lock(sessionMutex);
+			s = session;
+		}
+
+		if (!s) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(20));
+			continue;
+		}
+
+		RawFrame frame = s->getLatestFrame();
+		if (frame.width <= 0 || frame.height <= 0 || !frame.rgb || frame.frameCounter == lastSeenRawFrameCounter) {
 			std::this_thread::sleep_for(std::chrono::milliseconds(4));
 			continue;
 		}
+		lastSeenRawFrameCounter = frame.frameCounter;
 
-		CapResult res = Cap_captureFrame(ctx, stream, rgbBuffer.data(), static_cast<uint32_t>(rgbBuffer.size()));
-		if (res != CAPRESULT_OK) {
-			connected = false;
-			continue;
-		}
-
-		cv::Mat frame(frameHeight, frameWidth, CV_8UC3, rgbBuffer.data());
+		cv::Mat mat(frame.height, frame.width, CV_8UC3, const_cast<uint8_t*>(frame.rgb->data()));
 		AnalysisParams params;
 		{
 			std::lock_guard<std::mutex> lock(paramsMutex);
 			params = analysisParams;
 		}
 
-		AnalysisResult result = analyzer.analyze(frame, params);
-		result.frameCounter = ++frameCounter;
+		AnalysisResult result = analyzer.analyze(mat, params);
+		result.frameCounter = ++analysisFrameCounter;
 		frameBuffer.write(result);
-		connected = true;
 
-		// Regenerate the preview thumbnail every few frames — resize +
-		// color conversion is comparatively expensive, and a UI preview
-		// doesn't need to update at full camera frame rate.
+		// Regenerate the preview thumbnail every few analyzed frames —
+		// resize + color conversion is comparatively expensive, and a UI
+		// preview doesn't need to update at full camera frame rate.
 		if (++thumbnailSkipCounter >= 3) {
 			thumbnailSkipCounter = 0;
 			const int maxDim = 160;
-			float scale = (frameWidth >= frameHeight)
-				? static_cast<float>(maxDim) / frameWidth
-				: static_cast<float>(maxDim) / frameHeight;
-			int tw = std::max(1, static_cast<int>(frameWidth * scale));
-			int th = std::max(1, static_cast<int>(frameHeight * scale));
+			float scale = (frame.width >= frame.height)
+				? static_cast<float>(maxDim) / frame.width
+				: static_cast<float>(maxDim) / frame.height;
+			int tw = std::max(1, static_cast<int>(frame.width * scale));
+			int th = std::max(1, static_cast<int>(frame.height * scale));
 
 			cv::Mat small, rgba;
-			cv::resize(frame, small, cv::Size(tw, th));
+			cv::resize(mat, small, cv::Size(tw, th));
 			cv::cvtColor(small, rgba, cv::COLOR_RGB2RGBA);
 
 			Thumbnail thumb;
@@ -287,10 +203,4 @@ void CameraWorker::threadLoop() {
 			thumbnailBuffer.write(thumb);
 		}
 	}
-
-	// Shutdown, still entirely on this thread.
-	if (ctx && stream >= 0)
-		Cap_closeStream(ctx, stream);
-	if (ctx)
-		Cap_releaseContext(ctx);
 }

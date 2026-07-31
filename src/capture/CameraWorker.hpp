@@ -4,89 +4,94 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
-#include <openpnp-capture.h>
+#include <memory>
 #include "../analysis/FrameAnalyzer.hpp"
 #include "../shared/FrameBuffer.hpp"
 #include "../shared/Thumbnail.hpp"
+#include "../shared/CameraTypes.hpp"
+
+class SharedCameraSession;
 
 
-/** Owns a camera device (via OpenPnP Capture) and a background thread that
-continuously grabs and analyzes frames.
+/** Per-module analysis pipeline. Subscribes to a SharedCameraSession (via
+CameraSessionManager) for whichever physical camera this module instance
+has selected, and runs this module's own FrameAnalyzer — independent
+MODE/HUE/TOLERANCE/etc. per instance — on the frames that session
+publishes.
 
-Every single Cap_* call — including Cap_createContext() and device
-enumeration, not just frame capture — happens exclusively on the worker
-thread. On macOS, creating a capture context triggers AVFoundation's camera
-authorization flow, which needs the calling thread's run loop free to
-complete; calling it from Rack's UI/main thread (e.g. directly in this
-class's constructor) deadlocks that thread and gets the whole app killed by
-the OS watchdog. So the worker thread owns its CapContext/CapStream for its
-entire lifetime, and every other method here only posts a request or reads a
-cache — never touches Cap_* directly.
-*/
+Actual camera I/O lives entirely in SharedCameraSession/
+CameraSessionManager now: multiple module instances pointed at the same
+physical camera share one real capture session instead of each opening
+their own. Opening the same consumer/UVC webcam twice independently isn't
+reliably supported by the hardware, and reconfiguring one such independent
+stream's resolution could corrupt the other — this split is the fix for
+that (previously a real, reproduced bug).
+
+This class's own public API is unchanged from when it owned capture
+directly, so the Module/ModuleWidget code using it didn't need to change. */
 class CameraWorker {
 public:
-	struct DeviceInfo {
-		std::string name;
-		std::string uniqueId;
-	};
+	using DeviceInfo = CameraDeviceInfo;
+	using FormatOption = CameraFormatOption;
 
 	CameraWorker();
 	~CameraWorker();
 
-	/** Returns the most recently cached device list (refreshed roughly once
-	a second by the worker thread). Safe to call from the UI thread at any
-	time — never blocks, never touches the capture library directly. */
+	/** Returns the process-wide cached device list (refreshed roughly once
+	a second). Safe to call from the UI thread at any time — never blocks,
+	never touches the capture library directly. */
 	std::vector<DeviceInfo> listDevices();
 
-	/** Request that the worker thread open a camera by its index into the
-	most recent listDevices() result. Non-blocking: just posts the request:
-	the actual open happens on the worker thread a few milliseconds later.
-	Pass -1 to request closing the current device. */
+	/** Request subscribing to the camera at this index into the most recent
+	listDevices() result. Non-blocking. Pass -1 to unsubscribe. */
 	void selectDevice(int index);
 
-	/** Request opening a camera by its unique device ID (used to restore a
-	patch's saved selection). Non-blocking; resolved against the worker
-	thread's own device cache, so it's safe to call before that cache has
-	ever been populated — the request just waits until it has been. */
+	/** Request subscribing by unique device ID (used to restore a patch's
+	saved selection). Non-blocking; safe to call before the device cache has
+	ever been populated. */
 	void selectDeviceByUniqueId(const std::string& uniqueId);
 
-	/** Request closing the current device, if any. Non-blocking. */
+	/** Unsubscribe from the current camera, if any. Non-blocking. */
 	void close();
 
-	/** Update the analysis parameters the worker reads each frame. Safe to
-	call from the audio thread at any time. */
+	/** Update the analysis parameters this instance's analyzer reads each
+	frame. Safe to call from the audio thread at any time. */
 	void setAnalysisParams(const AnalysisParams& params);
 
-	/** Get the most recently analyzed frame's results (or a default,
-	disconnected result if no camera has ever been opened). */
+	/** Get this instance's most recently analyzed frame's results (or a
+	default, disconnected result if no camera has ever been selected). */
 	AnalysisResult getLatestResult();
 
-	/** Get the most recently generated preview thumbnail (or a default,
-	empty one — check width/height before using). Refreshed at a lower rate
-	than analysis results; see threadLoop(). */
+	/** Get this instance's most recently generated preview thumbnail (or a
+	default, empty one — check width/height before using). */
 	Thumbnail getLatestThumbnail();
 
-	bool isConnected() const { return connected.load(); }
+	bool isConnected();
 	std::string getDeviceName();
 	std::string getDeviceUniqueId();
 
+	/** Resolutions/frame-rates the currently subscribed camera reports.
+	Empty if not subscribed to anything yet. */
+	std::vector<FormatOption> listFormats();
+
+	/** The format actually in use right now (or a zeroed FormatOption if
+	not subscribed). For checkmarking the resolution menu. */
+	FormatOption getCurrentFormat();
+
+	/** Request a different resolution/frame rate for the camera this
+	instance is subscribed to. Affects every other module instance sharing
+	that same physical camera too — see SharedCameraSession's class comment
+	for why that's the correct, hardware-honest behavior. No-op if not
+	currently subscribed to anything. */
+	void setPreferredFormat(uint32_t width, uint32_t height, uint32_t fps);
+
 private:
-	void threadLoop();
-	/** All of the below are only ever touched from within threadLoop() —
-	i.e. only from the worker thread. No mutex needed for them. */
-	void refreshDeviceCache();
-	void openDeviceInternal(int index);
-	void closeStreamInternal();
-	CapFormatID pickFormat(CapDeviceID index, uint32_t& outWidth, uint32_t& outHeight);
+	void analysisThreadLoop();
 
-	CapContext ctx = nullptr;
-	CapStream stream = -1;
-	int frameWidth = 0;
-	int frameHeight = 0;
-	std::vector<uint8_t> rgbBuffer;
-	uint32_t frameCounter = 0;
+	std::mutex sessionMutex;
+	std::shared_ptr<SharedCameraSession> session;
 
-	// --- Cross-thread request queue: UI thread writes, worker thread reads/clears ---
+	// --- Cross-thread request queue: UI thread writes, analysis thread reads/clears ---
 	std::mutex requestMutex;
 	bool closeRequested = false;
 	bool selectRequested = false;
@@ -94,28 +99,18 @@ private:
 	bool selectByUidRequested = false;
 	std::string requestedUid;
 
-	// --- Cross-thread caches: worker thread writes, UI thread reads ---
-	std::mutex deviceCacheMutex;
-	std::vector<DeviceInfo> deviceCache;
-
-	std::mutex nameMutex;
-	std::string deviceName;
-	std::string deviceUniqueId;
-
-	std::thread worker;
-	std::atomic<bool> running{true};
-	std::atomic<bool> connected{false};
-
 	std::mutex paramsMutex;
 	AnalysisParams analysisParams;
 
 	FrameAnalyzer analyzer;
 	FrameBuffer frameBuffer;
+	uint32_t analysisFrameCounter = 0;
+	uint32_t lastSeenRawFrameCounter = 0;
 
-	// Preview thumbnail: regenerated every few frames (not every frame —
-	// resizing/converting is comparatively expensive and a UI preview
-	// doesn't need full frame rate).
 	ThumbnailBuffer thumbnailBuffer;
-	uint32_t thumbnailFrameCounter = 0;
 	int thumbnailSkipCounter = 0;
+	uint32_t thumbnailFrameCounter = 0;
+
+	std::thread worker;
+	std::atomic<bool> running{true};
 };

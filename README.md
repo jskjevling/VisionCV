@@ -4,12 +4,14 @@ A [VCV Rack](https://vcvrack.com) module that turns a live camera feed into
 control voltage: brightness, RGB channel levels, motion, and position
 tracking (brightest spot, or a chosen color blob).
 
-**Status: Phase 2, macOS only.** The full pipeline works end-to-end and has
-been verified both standalone (device enumeration, thread lifecycle, live
-analysis against a real webcam) and inside VCV Rack 2 Pro (module
-instantiates, camera opens, live preview updates, no crashes on repeated
-add/remove). Windows/Linux builds and a resolution/FPS menu are the
-remaining known gaps — see "Roadmap" below.
+**Status: Phase 2, macOS only.** The full pipeline works end-to-end,
+including a right-click resolution/FPS menu, and has been verified both
+standalone (device enumeration, thread lifecycle, live analysis against a
+real webcam, multiple concurrent instances sharing one physical camera) and
+inside VCV Rack 2 Pro (module instantiates, camera opens, live preview
+updates, no crashes on repeated add/remove or resolution changes — including
+with multiple instances pointed at the same camera). Windows/Linux builds
+are the remaining known gap — see "Roadmap" below.
 
 **Requires a one-time local patch to your VCV Rack installation — see
 "macOS camera permission" below before building.** Not distributed through
@@ -39,7 +41,9 @@ including how to undo it.
 We've asked VCV support whether `NSCameraUsageDescription` could be added to
 an official Rack release — that's the only fix that wouldn't require this
 local patch (or a separate camera-capture helper process; see "VCV Library
-packaging" below). No response yet.
+packaging" below). They've said they'll take it under consideration and
+follow up if/when it's added — a holding pattern for now, not something to
+build around in the meantime.
 
 ## What it does
 
@@ -65,6 +69,12 @@ current output values, including Found.
 The selected camera is saved with the patch (matched back by the camera's
 own unique ID on load, not by index, since USB device indices aren't
 stable across reboots/reconnects) and restored automatically.
+
+Right-click the module for a resolution/FPS menu listing whatever the
+selected camera actually reports. If multiple VisionCV instances are pointed
+at the same physical camera, they share one real capture stream — changing
+resolution from any one of them applies to all of them, since it's genuinely
+one piece of hardware. See "Architecture" below for why.
 
 ## Building (macOS, Apple Silicon)
 
@@ -118,26 +128,55 @@ version.
 
 ## Architecture
 
-- `src/capture/CameraWorker` — owns the camera (via OpenPnP Capture) and a
-  background thread that continuously grabs and analyzes frames. Every
-  single call into OpenPnP Capture — including creating the capture context
-  and enumerating devices, not just grabbing frames — happens exclusively on
-  that worker thread. On macOS, creating a capture context triggers the
-  camera-authorization flow, which needs its calling thread's run loop free
-  to complete; calling any of this from Rack's UI/main thread (e.g. directly
-  in a constructor) deadlocks that thread and gets the process killed. Every
-  other method on `CameraWorker` just posts a request or reads a cache —
-  never touches the capture library directly — so it's safe to call from
-  wherever Rack calls it (module construction, the audio thread, the
-  right-click menu).
+Camera I/O and per-module analysis are deliberately split into two layers,
+because consumer/UVC webcams generally don't support two truly independent
+capture sessions with different resolution configs running at once —
+reconfiguring one affects the physical device out from under any other
+session's own state tracking. Two independent VisionCV instances pointed at
+the same physical camera used to be able to corrupt or crash each other this
+way (a real, reproduced bug); the fix was to stop each module instance from
+owning capture itself and instead have every instance pointed at the same
+camera share one real stream.
+
+- `src/capture/CameraSessionManager` — process-wide singleton owning the
+  single OpenPnP Capture context and its single background thread, no matter
+  how many module instances or cameras are involved. Every `Cap_*` call for
+  every open camera — enumeration, opening/closing streams, grabbing frames,
+  changing format — happens exclusively on this one thread. On macOS,
+  creating a capture context triggers the camera-authorization flow, which
+  needs its calling thread's run loop free to complete; calling any of this
+  from Rack's UI/main thread deadlocks that thread and gets the process
+  killed. Every public method here just posts a request or reads a cache, so
+  it's safe to call from wherever Rack calls it (module construction, the
+  audio thread, the right-click menu).
+- `src/capture/SharedCameraSession` — one real, physical-camera stream,
+  ref-counted (`shared_ptr`/`weak_ptr`) across every module instance
+  currently subscribed to that device. Holds the thread-safe published state
+  (latest raw frame, connection status, format info) that any number of
+  module analysis threads read concurrently; the manager thread is the only
+  writer. Created on first subscriber, torn down once the last subscriber
+  releases it.
+- `src/capture/CameraWorker` — one per module instance. Subscribes to
+  whichever `SharedCameraSession` its module has selected (via
+  `CameraSessionManager`) and runs that instance's own `FrameAnalyzer` —
+  independent Mode/Hue/Tolerance/etc. per instance — on the frames that
+  session publishes. Its own background thread never touches OpenPnP Capture
+  directly anymore; it only reads frames and posts selection requests. This
+  class's public API is unchanged from when it owned capture directly, so
+  `VisionCV.cpp` didn't need to change for this split.
 - `src/analysis/FrameAnalyzer` — the actual OpenCV math: brightness, RGB
   means, frame-diff motion, brightest-spot/color-blob position tracking.
+  Stateful per instance (motion history, held position), so it stays owned
+  by each module's own `CameraWorker`, not the shared session.
 - `src/shared/FrameBuffer` — mutex-guarded handoff of the latest analysis
-  result from the worker thread to the audio thread.
-- `src/shared/Thumbnail` — same idea, for the downscaled RGBA preview image
-  handed to the UI thread. Regenerated every 3rd captured frame (~10fps),
-  since resizing/color-converting every frame at full camera rate is wasted
-  cost for a small UI preview.
+  result from a `CameraWorker`'s thread to the audio thread.
+- `src/shared/RawFrame` — same idea, one level down: the shared session
+  publishes captured frames this way, cheaply (a `shared_ptr` copy, not a
+  deep copy) to every subscribing `CameraWorker`.
+- `src/shared/Thumbnail` — same idea again, for the downscaled RGBA preview
+  image handed to the UI thread. Regenerated every 3rd captured frame
+  (~10fps), since resizing/color-converting every frame at full camera rate
+  is wasted cost for a small UI preview.
 - `src/VisionCV.cpp` — the Rack `Module`/`ModuleWidget`. `process()` never
   touches the camera or OpenCV directly — it only reads the latest result,
   smooths it, and writes voltages. The widget draws its own panel text at
@@ -145,8 +184,9 @@ version.
   into the panel SVG, since VCV Rack's SVG renderer (NanoSVG) doesn't render
   `<text>` as real glyphs.
 
-`CameraWorker`/`FrameAnalyzer` have no Rack dependency and can be exercised
-standalone (useful for testing without the Rack GUI).
+Everything under `src/capture/` and `src/analysis/` has no Rack dependency
+and can be exercised standalone (useful for testing against real camera
+hardware without the Rack GUI).
 
 ## VCV Library packaging
 
@@ -170,11 +210,13 @@ of Rack community plugins are distributed that way.
 1. ~~macOS prototype: capture, all 4 analysis features, camera-select menu~~ ✅
 2. ~~Polish: live preview thumbnail + click-to-pick color, Found gate,
    restore selected camera across patch load~~ ✅
-3. Resolution/FPS selection menu; graceful reconnect UX if a USB camera is
-   unplugged mid-session
+3. ~~Resolution/FPS selection menu; shared camera-session architecture so
+   multiple instances on one physical camera can't corrupt each other~~ ✅
 4. Windows static build (cross-compiled via `rack-plugin-toolchain`)
 5. Linux static build
 6. Packaging for the VCV Library (Windows/Linux only — see above)
+7. Graceful reconnect UX if a USB camera is unplugged mid-session (not yet
+   handled explicitly)
 
 ## License
 
