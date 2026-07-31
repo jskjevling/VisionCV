@@ -12,58 +12,60 @@ namespace layout {
 static const float PANEL_W = 71.12f;
 static const float CENTER_X = PANEL_W / 2.f; // 35.56
 
-// Jack rows (4 across). Halved the gap between the (13mm-wide) output
-// boxes, not the raw center-to-center pitch — halving pitch outright would
-// make adjacent boxes overlap.
-static const float JACK1_X = 12.f;
-static const float JACK2_X = 27.7f;
-static const float JACK3_X = 43.4f;
-static const float JACK4_X = 59.1f;
-
-// Knob rows (3 across). Outer columns aligned to the jack rows' outer
-// columns (JACK1_X/JACK4_X) for a uniform look and to give the row-2 labels
-// ("TOLERANCE"/"MOTION SENS"/"SMOOTHING") enough width to not run together.
-static const float KNOB_LEFT_X = JACK1_X;
-static const float KNOB_CENTER_X = CENTER_X;
-static const float KNOB_RIGHT_X = JACK4_X;
-
 static const float TITLE_Y = 7.f;
-static const float SUBTITLE_Y = 11.5f;
 
-// Live preview thumbnail, above the camera-select display.
-static const float PREVIEW_W = 44.f;
-static const float PREVIEW_H = 33.f; // 4:3
+// Live preview thumbnail, above the camera-select display. No subtitle
+// tagline below the title anymore — that space now just shortens the gap
+// to the preview, and the whole content block below is pulled up by the
+// same amount, growing the bottom margin instead.
+static const float PREVIEW_W = 40.f;
+static const float PREVIEW_H = 30.f; // 4:3
 static const float PREVIEW_X = (PANEL_W - PREVIEW_W) / 2.f;
-static const float PREVIEW_Y = 14.f;
+static const float PREVIEW_Y = 10.f;
 
 static const float DISPLAY_X = 6.f;
-static const float DISPLAY_Y = PREVIEW_Y + PREVIEW_H + 2.f; // 49
+static const float DISPLAY_Y = PREVIEW_Y + PREVIEW_H + 2.f; // 42
 static const float DISPLAY_W = PANEL_W - 2.f * DISPLAY_X;
 static const float DISPLAY_H = 7.f;
 
-// Knob rows: a RoundBlackKnob is ~10mm across (5mm radius), so a label
-// needs to sit ~6mm above its own row's control center to clear it, and
-// 15mm of row pitch gives real breathing room from the row above's knob too.
-static const float ROW1_LABEL_Y = 60.f; // mode / hue / tolerance
-static const float ROW1_Y = 66.f;
-static const float ROW2_LABEL_Y = 75.f; // motion sens / smoothing / freeze
-static const float ROW2_Y = 81.f;
-
-static const float DIVIDER_Y = 89.f;
-
-// Jacks: outputs are marked with an inverted (white box, black text) label
-// that wraps the jack as well as the text — see OutputBoxWidget — so 15mm
-// of pitch is needed for that taller box to clear the row below.
-static const float JACK_ROW1_LABEL_Y = 94.f; // freeze / bright / red / green
-static const float JACK_ROW1_Y = 99.f;
-static const float JACK_ROW2_LABEL_Y = 109.f; // blue / motion / pos x / pos y
-static const float JACK_ROW2_Y = 114.f;
-
 // Fixed size for the white output box: wide enough for the longest label and
 // tall enough to span from just above the label down to just below the jack.
+// Declared here (ahead of COL_LEFT_X/COL_RIGHT_X below, which reference
+// OUT_BOX_W) rather than down by OutputBoxWidget where it's used, since
+// namespace-scope const initializers must see earlier declarations only.
 static const float OUT_BOX_W = 13.f;
-static const float OUT_BOX_TOP_PAD = 3.25f; // above the label baseline
-static const float OUT_BOX_BOTTOM_PAD = 5.6f; // below the port center (radius + margin)
+static const float OUT_BOX_TOP_PAD = 2.5f; // above the label baseline
+static const float OUT_BOX_BOTTOM_PAD = 5.f; // below the port center (radius + margin)
+
+// Shared 3-column grid used by both the knob rows and the jack rows, so
+// everything lines up vertically across the whole panel. The outer columns
+// are set so the output boxes' own outer edges land exactly on the camera
+// display's edges (DISPLAY_X and DISPLAY_X + DISPLAY_W) — the boxes and the
+// display line up cleanly instead of one being a bit wider than the other.
+static const float COL_LEFT_X = DISPLAY_X + OUT_BOX_W / 2.f;
+static const float COL_CENTER_X = CENTER_X;
+static const float COL_RIGHT_X = DISPLAY_X + DISPLAY_W - OUT_BOX_W / 2.f;
+
+// Knob rows: a RoundBlackKnob is ~10mm across (5mm radius), so a label
+// needs to sit ~6mm above its own row's control center to clear it, and
+// 15mm of row pitch clears the row above's knob too.
+static const float ROW1_LABEL_Y = 53.f; // mode / hue / freeze
+static const float ROW1_Y = 59.f;
+static const float ROW2_LABEL_Y = 68.f; // tolerance / motion sens / smoothing
+static const float ROW2_Y = 74.f;
+
+static const float DIVIDER_Y = 81.f;
+
+// 9 jacks total (1 input + 8 outputs, including the FOUND gate) as 3 rows
+// of 3 instead of 2 rows of 4, matching the knob columns above. Outputs are
+// marked with an inverted (white box, black text) label that wraps the jack
+// as well as the text — see OutputBoxWidget.
+static const float JACK_ROW1_LABEL_Y = 86.f; // freeze / red / green
+static const float JACK_ROW1_Y = 91.f;
+static const float JACK_ROW2_LABEL_Y = 99.f; // blue / bright / motion
+static const float JACK_ROW2_Y = 104.f;
+static const float JACK_ROW3_LABEL_Y = 112.f; // pos x / pos y / found
+static const float JACK_ROW3_Y = 117.f;
 } // namespace layout
 
 
@@ -89,6 +91,7 @@ struct VisionCV : Module {
 		MOTION_OUTPUT,
 		POS_X_OUTPUT,
 		POS_Y_OUTPUT,
+		FOUND_OUTPUT,
 		OUTPUTS_LEN
 	};
 	enum LightId {
@@ -127,6 +130,7 @@ struct VisionCV : Module {
 		configOutput(MOTION_OUTPUT, "Motion");
 		configOutput(POS_X_OUTPUT, "Position X");
 		configOutput(POS_Y_OUTPUT, "Position Y");
+		configOutput(FOUND_OUTPUT, "Found (color-lock gate)");
 	}
 
 	void selectCamera(int index) {
@@ -181,6 +185,10 @@ struct VisionCV : Module {
 		// 0..1 -> -5V..+5V, 0.5 = center. Invert Y so "up" in frame reads positive.
 		outputs[POS_X_OUTPUT].setVoltage(clamp(posX, 0.f, 1.f) * 10.f - 5.f);
 		outputs[POS_Y_OUTPUT].setVoltage(-(clamp(posY, 0.f, 1.f) * 10.f - 5.f));
+		// High whenever the tracker has a confident lock: always true in
+		// brightest-spot mode, and in color-blob mode only when this frame's
+		// pixels actually matched the target color band.
+		outputs[FOUND_OUTPUT].setVoltage(result.found ? 10.f : 0.f);
 	}
 
 	json_t* dataToJson() override {
@@ -467,32 +475,35 @@ struct VisionCVWidget : ModuleWidget {
 		};
 
 		// Knob rows: 3 across, 2 rows.
-		addParam(createParamCentered<CKSS>(mm2px(Vec(KNOB_LEFT_X, ROW1_Y)), module, VisionCV::MODE_PARAM));
-		addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(KNOB_CENTER_X, ROW1_Y)), module, VisionCV::HUE_PARAM));
-		addParam(createLightParamCentered<VCVLightButton<GreenLight>>(mm2px(Vec(KNOB_RIGHT_X, ROW1_Y)), module, VisionCV::FREEZE_PARAM, VisionCV::FREEZE_LIGHT));
+		addParam(createParamCentered<CKSS>(mm2px(Vec(COL_LEFT_X, ROW1_Y)), module, VisionCV::MODE_PARAM));
+		addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(COL_CENTER_X, ROW1_Y)), module, VisionCV::HUE_PARAM));
+		addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(COL_RIGHT_X, ROW1_Y)), module, VisionCV::TOLERANCE_PARAM));
 
-		addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(KNOB_LEFT_X, ROW2_Y)), module, VisionCV::TOLERANCE_PARAM));
-		addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(KNOB_CENTER_X, ROW2_Y)), module, VisionCV::MOTION_SENS_PARAM));
-		addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(KNOB_RIGHT_X, ROW2_Y)), module, VisionCV::SMOOTHING_PARAM));
+		addParam(createLightParamCentered<VCVLightButton<GreenLight>>(mm2px(Vec(COL_LEFT_X, ROW2_Y)), module, VisionCV::FREEZE_PARAM, VisionCV::FREEZE_LIGHT));
+		addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(COL_CENTER_X, ROW2_Y)), module, VisionCV::MOTION_SENS_PARAM));
+		addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(COL_RIGHT_X, ROW2_Y)), module, VisionCV::SMOOTHING_PARAM));
 
-		// Jack rows: 4 across, 2 rows. Freeze input is plain (not boxed);
-		// everything else here is an output and gets a box.
-		addInput(createInputCentered<PJ301MPort>(mm2px(Vec(JACK1_X, JACK_ROW1_Y)), module, VisionCV::FREEZE_CV_INPUT));
-		addOutputBox(JACK2_X, JACK_ROW1_LABEL_Y, JACK_ROW1_Y);
-		addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(JACK2_X, JACK_ROW1_Y)), module, VisionCV::RED_OUTPUT));
-		addOutputBox(JACK3_X, JACK_ROW1_LABEL_Y, JACK_ROW1_Y);
-		addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(JACK3_X, JACK_ROW1_Y)), module, VisionCV::GREEN_OUTPUT));
-		addOutputBox(JACK4_X, JACK_ROW1_LABEL_Y, JACK_ROW1_Y);
-		addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(JACK4_X, JACK_ROW1_Y)), module, VisionCV::BLUE_OUTPUT));
+		// Jack rows: 3 across, 3 rows (1 input + 8 outputs). Freeze input is
+		// plain (not boxed); everything else here is an output and gets a box.
+		addInput(createInputCentered<PJ301MPort>(mm2px(Vec(COL_LEFT_X, JACK_ROW1_Y)), module, VisionCV::FREEZE_CV_INPUT));
+		addOutputBox(COL_CENTER_X, JACK_ROW1_LABEL_Y, JACK_ROW1_Y);
+		addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(COL_CENTER_X, JACK_ROW1_Y)), module, VisionCV::FOUND_OUTPUT));
+		addOutputBox(COL_RIGHT_X, JACK_ROW1_LABEL_Y, JACK_ROW1_Y);
+		addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(COL_RIGHT_X, JACK_ROW1_Y)), module, VisionCV::BRIGHTNESS_OUTPUT));
 
-		addOutputBox(JACK1_X, JACK_ROW2_LABEL_Y, JACK_ROW2_Y);
-		addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(JACK1_X, JACK_ROW2_Y)), module, VisionCV::BRIGHTNESS_OUTPUT));
-		addOutputBox(JACK2_X, JACK_ROW2_LABEL_Y, JACK_ROW2_Y);
-		addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(JACK2_X, JACK_ROW2_Y)), module, VisionCV::MOTION_OUTPUT));
-		addOutputBox(JACK3_X, JACK_ROW2_LABEL_Y, JACK_ROW2_Y);
-		addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(JACK3_X, JACK_ROW2_Y)), module, VisionCV::POS_X_OUTPUT));
-		addOutputBox(JACK4_X, JACK_ROW2_LABEL_Y, JACK_ROW2_Y);
-		addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(JACK4_X, JACK_ROW2_Y)), module, VisionCV::POS_Y_OUTPUT));
+		addOutputBox(COL_LEFT_X, JACK_ROW2_LABEL_Y, JACK_ROW2_Y);
+		addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(COL_LEFT_X, JACK_ROW2_Y)), module, VisionCV::RED_OUTPUT));
+		addOutputBox(COL_CENTER_X, JACK_ROW2_LABEL_Y, JACK_ROW2_Y);
+		addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(COL_CENTER_X, JACK_ROW2_Y)), module, VisionCV::GREEN_OUTPUT));
+		addOutputBox(COL_RIGHT_X, JACK_ROW2_LABEL_Y, JACK_ROW2_Y);
+		addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(COL_RIGHT_X, JACK_ROW2_Y)), module, VisionCV::BLUE_OUTPUT));
+
+		addOutputBox(COL_LEFT_X, JACK_ROW3_LABEL_Y, JACK_ROW3_Y);
+		addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(COL_LEFT_X, JACK_ROW3_Y)), module, VisionCV::MOTION_OUTPUT));
+		addOutputBox(COL_CENTER_X, JACK_ROW3_LABEL_Y, JACK_ROW3_Y);
+		addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(COL_CENTER_X, JACK_ROW3_Y)), module, VisionCV::POS_X_OUTPUT));
+		addOutputBox(COL_RIGHT_X, JACK_ROW3_LABEL_Y, JACK_ROW3_Y);
+		addOutput(createOutputCentered<PJ301MPort>(mm2px(Vec(COL_RIGHT_X, JACK_ROW3_Y)), module, VisionCV::POS_Y_OUTPUT));
 	}
 
 	/** Panel text is drawn here, not baked into the SVG, because VCV Rack's
@@ -512,7 +523,6 @@ struct VisionCVWidget : ModuleWidget {
 		using namespace layout;
 
 		NVGcolor titleColor = nvgRGB(0x5f, 0xd0, 0xe8);
-		NVGcolor dimColor = nvgRGB(0x8a, 0x8d, 0x95);
 		NVGcolor labelColor = nvgRGB(0xc7, 0xc9, 0xcf);
 
 		nvgSave(args.vg);
@@ -568,25 +578,26 @@ struct VisionCVWidget : ModuleWidget {
 		// control/jack labels in DejaVu Sans, all-caps, matching the
 		// small-caps-label convention used across VCV's stock modules.
 		smallCapsTitle(CENTER_X, TITLE_Y, 6.f, 4.3f, titleColor);
-		label(bodyFont.get(), CENTER_X, SUBTITLE_Y, 3.2f, dimColor, "CAMERA -> CV");
 
-		label(bodyFont.get(), KNOB_LEFT_X, ROW1_LABEL_Y, 3.f, labelColor, "MODE");
-		label(bodyFont.get(), KNOB_CENTER_X, ROW1_LABEL_Y, 3.f, labelColor, "HUE");
-		label(bodyFont.get(), KNOB_RIGHT_X, ROW1_LABEL_Y, 3.f, labelColor, "FREEZE");
+		label(bodyFont.get(), COL_LEFT_X, ROW1_LABEL_Y, 3.f, labelColor, "MODE");
+		label(bodyFont.get(), COL_CENTER_X, ROW1_LABEL_Y, 3.f, labelColor, "HUE");
+		label(bodyFont.get(), COL_RIGHT_X, ROW1_LABEL_Y, 3.f, labelColor, "TOLERANCE");
 
-		label(bodyFont.get(), KNOB_LEFT_X, ROW2_LABEL_Y, 3.f, labelColor, "TOLERANCE");
-		label(bodyFont.get(), KNOB_CENTER_X, ROW2_LABEL_Y, 3.f, labelColor, "MOTION SENS");
-		label(bodyFont.get(), KNOB_RIGHT_X, ROW2_LABEL_Y, 3.f, labelColor, "SMOOTHING");
+		label(bodyFont.get(), COL_LEFT_X, ROW2_LABEL_Y, 3.f, labelColor, "FREEZE");
+		label(bodyFont.get(), COL_CENTER_X, ROW2_LABEL_Y, 3.f, labelColor, "MOTION SENS");
+		label(bodyFont.get(), COL_RIGHT_X, ROW2_LABEL_Y, 3.f, labelColor, "SMOOTHING");
 
-		label(bodyFont.get(), JACK1_X, JACK_ROW1_LABEL_Y, 3.f, labelColor, "FREEZE");
-		outputLabel(JACK2_X, JACK_ROW1_LABEL_Y, 3.f, "RED");
-		outputLabel(JACK3_X, JACK_ROW1_LABEL_Y, 3.f, "GREEN");
-		outputLabel(JACK4_X, JACK_ROW1_LABEL_Y, 3.f, "BLUE");
+		label(bodyFont.get(), COL_LEFT_X, JACK_ROW1_LABEL_Y, 3.f, labelColor, "FREEZE");
+		outputLabel(COL_CENTER_X, JACK_ROW1_LABEL_Y, 3.f, "FOUND");
+		outputLabel(COL_RIGHT_X, JACK_ROW1_LABEL_Y, 3.f, "BRIGHT");
 
-		outputLabel(JACK1_X, JACK_ROW2_LABEL_Y, 3.f, "BRIGHT");
-		outputLabel(JACK2_X, JACK_ROW2_LABEL_Y, 3.f, "MOTION");
-		outputLabel(JACK3_X, JACK_ROW2_LABEL_Y, 3.f, "POS X");
-		outputLabel(JACK4_X, JACK_ROW2_LABEL_Y, 3.f, "POS Y");
+		outputLabel(COL_LEFT_X, JACK_ROW2_LABEL_Y, 3.f, "RED");
+		outputLabel(COL_CENTER_X, JACK_ROW2_LABEL_Y, 3.f, "GREEN");
+		outputLabel(COL_RIGHT_X, JACK_ROW2_LABEL_Y, 3.f, "BLUE");
+
+		outputLabel(COL_LEFT_X, JACK_ROW3_LABEL_Y, 3.f, "MOTION");
+		outputLabel(COL_CENTER_X, JACK_ROW3_LABEL_Y, 3.f, "POS X");
+		outputLabel(COL_RIGHT_X, JACK_ROW3_LABEL_Y, 3.f, "POS Y");
 
 		nvgRestore(args.vg);
 	}

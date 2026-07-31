@@ -4,13 +4,12 @@ A [VCV Rack](https://vcvrack.com) module that turns a live camera feed into
 control voltage: brightness, RGB channel levels, motion, and position
 tracking (brightest spot, or a chosen color blob).
 
-**Status: Phase 1 prototype, macOS only.** Core capture/analysis pipeline and
-the full module are implemented and verified: standalone (device
-enumeration, thread start/stop lifecycle, live analysis against a real
-webcam) and inside VCV Rack 2 Pro itself (module instantiates, camera opens,
-no crashes on repeated add/remove). Windows/Linux builds and in-app polish
-(camera preview thumbnail, disconnect handling, patch-load camera restore)
-are follow-up phases — see "Roadmap" below.
+**Status: Phase 2, macOS only.** The full pipeline works end-to-end and has
+been verified both standalone (device enumeration, thread lifecycle, live
+analysis against a real webcam) and inside VCV Rack 2 Pro (module
+instantiates, camera opens, live preview updates, no crashes on repeated
+add/remove). Windows/Linux builds and a resolution/FPS menu are the
+remaining known gaps — see "Roadmap" below.
 
 **Requires a one-time local patch to your VCV Rack installation — see
 "macOS camera permission" below before building.** Not distributed through
@@ -37,10 +36,16 @@ This needs to be redone after every Rack update (updates overwrite the app
 bundle). See `DEPLOYMENT.md` for the full per-machine setup checklist,
 including how to undo it.
 
+We've asked VCV support whether `NSCameraUsageDescription` could be added to
+an official Rack release — that's the only fix that wouldn't require this
+local patch (or a separate camera-capture helper process; see "VCV Library
+packaging" below). No response yet.
+
 ## What it does
 
-Right-click the module to pick a connected camera. It analyzes frames on a
-background thread (never on the audio thread) and outputs:
+Click the live preview (or right-click the module, or click the camera-name
+display) to pick a connected camera. It analyzes frames on a background
+thread — never on the audio thread — and outputs:
 
 | Output | Range | Meaning |
 |---|---|---|
@@ -48,11 +53,18 @@ background thread (never on the audio thread) and outputs:
 | Red / Green / Blue | 0–10V each | Per-channel average level |
 | Motion | 0–10V | Frame-to-frame difference magnitude, gained by the Motion Sens knob |
 | Pos X / Pos Y | −5..+5V | Position of the tracked point; 0V = frame center, up = positive |
+| Found | 0/10V gate | High whenever the tracker has a confident lock — always high in brightest-spot mode, only high in color-blob mode when this frame actually matched the target color |
 
-**Mode** switch chooses what Pos X/Y track: the brightest pixel in frame, or
-a chosen color (Hue knob sets the target, Tolerance sets the accepted band
-width). **Smoothing** applies a one-pole filter to all outputs. **Freeze**
-(button or CV gate) holds the current output values.
+**Mode** switch chooses what Pos X/Y (and Found) track: the brightest pixel
+in frame, or a chosen color (Hue knob sets the target, Tolerance sets the
+accepted band width — or just click a color directly on the live preview,
+which also switches Mode to color-blob automatically). **Smoothing** applies
+a one-pole filter to all outputs. **Freeze** (button or CV gate) holds the
+current output values, including Found.
+
+The selected camera is saved with the patch (matched back by the camera's
+own unique ID on load, not by index, since USB device indices aren't
+stable across reboots/reconnects) and restored automatically.
 
 ## Building (macOS, Apple Silicon)
 
@@ -120,23 +132,49 @@ version.
   right-click menu).
 - `src/analysis/FrameAnalyzer` — the actual OpenCV math: brightness, RGB
   means, frame-diff motion, brightest-spot/color-blob position tracking.
-- `src/shared/FrameBuffer` — mutex-guarded handoff of the latest result from
-  the worker thread to the audio thread.
+- `src/shared/FrameBuffer` — mutex-guarded handoff of the latest analysis
+  result from the worker thread to the audio thread.
+- `src/shared/Thumbnail` — same idea, for the downscaled RGBA preview image
+  handed to the UI thread. Regenerated every 3rd captured frame (~10fps),
+  since resizing/color-converting every frame at full camera rate is wasted
+  cost for a small UI preview.
 - `src/VisionCV.cpp` — the Rack `Module`/`ModuleWidget`. `process()` never
   touches the camera or OpenCV directly — it only reads the latest result,
-  smooths it, and writes voltages.
+  smooths it, and writes voltages. The widget draws its own panel text at
+  runtime (`ModuleWidget::draw()`, via NanoVG) rather than baking `<text>`
+  into the panel SVG, since VCV Rack's SVG renderer (NanoSVG) doesn't render
+  `<text>` as real glyphs.
 
 `CameraWorker`/`FrameAnalyzer` have no Rack dependency and can be exercised
 standalone (useful for testing without the Rack GUI).
 
+## VCV Library packaging
+
+Not currently planned for macOS: submitting as-is would mean every user's
+first camera selection crashes Rack, since the Info.plist patch above can't
+travel with a plugin — only the host app's own bundle can satisfy macOS's
+per-process TCC check. Two paths could change that: VCV adding the
+entitlement to an official release (asked, no response yet), or splitting
+camera capture into a separate helper process with its own signed bundle/
+entitlement (a real fix, but a meaningfully sized new subsystem — a second
+binary, an IPC protocol, its own permission prompt). Neither is in progress.
+
+This is a macOS-specific problem (TCC has no equivalent on Windows/Linux for
+a plain desktop app), so it doesn't block Library packaging for those
+platforms once they're built. In the meantime, direct/GitHub distribution
+(what `DEPLOYMENT.md` sets up) works regardless of Library status — plenty
+of Rack community plugins are distributed that way.
+
 ## Roadmap
 
 1. ~~macOS prototype: capture, all 4 analysis features, camera-select menu~~ ✅
-2. Polish: live preview thumbnail + click-to-pick color, disconnect
-   handling, restore selected camera across patch load
-3. Windows static build (cross-compiled via `rack-plugin-toolchain`)
-4. Linux static build
-5. Packaging for the VCV Library
+2. ~~Polish: live preview thumbnail + click-to-pick color, Found gate,
+   restore selected camera across patch load~~ ✅
+3. Resolution/FPS selection menu; graceful reconnect UX if a USB camera is
+   unplugged mid-session
+4. Windows static build (cross-compiled via `rack-plugin-toolchain`)
+5. Linux static build
+6. Packaging for the VCV Library (Windows/Linux only — see above)
 
 ## License
 

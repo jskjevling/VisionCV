@@ -12,5 +12,5 @@
 	<rect x="0" y="0" width="71.12" height="128.5" fill="#1a1b1f"/>
 	<rect x="0.6" y="0.6" width="69.92" height="127.3" fill="none" stroke="#3a3c42" stroke-width="0.4"/>
 	<!-- Divider between controls and I/O — keep in sync with DIVIDER_Y in VisionCV.cpp -->
-	<line x1="4" y1="89" x2="67.12" y2="89" stroke="#3a3c42" stroke-width="0.3"/>
+	<line x1="4" y1="81" x2="67.12" y2="81" stroke="#3a3c42" stroke-width="0.3"/>
 </svg>
