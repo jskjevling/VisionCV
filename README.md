@@ -42,7 +42,7 @@ Right-click the module for a resolution/FPS menu listing whatever the selected c
 
 Requires Xcode Command Line Tools, Homebrew, and the VCV Rack SDK.
 
-**Important:** put the Rack SDK somewhere on a path with **no spaces**. GNU Make's `include` directive can't handle spaces in the path, and this repo itself lives under `.../VCV Rack/...` (has a space) — that's fine for the plugin's *own* build, but `RACK_DIR` must point elsewhere. This repo was built against the SDK at `~/dev-tools/Rack-SDK`.
+**Important:** put the Rack SDK somewhere on a path with **no spaces**. GNU Make's `include` directive can't handle spaces in the path. On my local machine this repo lives under `.../VCV Rack/...` (has a space) — that's fine for the plugin's *own* build, but `RACK_DIR` must point elsewhere. This repo was built against the SDK at `~/dev-tools/Rack-SDK`.
 
 ```sh
 # 1. Dependencies for local dev (OpenCV) and building OpenPnP Capture (cmake)
